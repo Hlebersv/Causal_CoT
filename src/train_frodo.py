@@ -1,236 +1,209 @@
-"""
-FRODO Training Script
-Demonstrates how to train the complete FRODO framework
-"""
-
+import argparse, copy, json, os
+from pathlib import Path
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from torch.utils.data import DataLoader
-import copy
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, get_linear_schedule_with_warmup
 
-from frodo import (
-    FRODO,
-    FRODOConfig,
-    DPODataset,
-    ReasoningDataset,
-)
+from frodo import FRODO, FRODOConfig, DPODataset, ReasoningDataset, setup_ddp, cleanup_ddp, is_main_process
 
+DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
-def create_example_dpo_data():
-    """Create example data for DPO training of inference module"""
-    return [
-        {
-            'question': 'Does a banana have more protein than an apple?',
-            'preferred_reasoning': 'Step 1: A banana contains approximately 1.3g of protein per 100g. '
-                                  'Step 2: An apple contains approximately 0.3g of protein per 100g. '
-                                  'Step 3: Since 1.3g > 0.3g, a banana has more protein.',
-            'dispreferred_reasoning': 'Step 1: Bananas are yellow. '
-                                     'Step 2: Apples are often red. '
-                                     'Step 3: Yellow fruits have more protein.',
-        },
-        {
-            'question': 'Would a candle last longer than a battery-powered flashlight?',
-            'preferred_reasoning': 'Step 1: A typical candle burns for 4-8 hours. '
-                                  'Step 2: A battery-powered flashlight can run for 20-100 hours depending on the battery. '
-                                  'Step 3: Therefore, a flashlight generally lasts longer.',
-            'dispreferred_reasoning': 'Step 1: Candles use fire. '
-                                     'Step 2: Fire is natural energy. '
-                                     'Step 3: Natural energy lasts longer.',
-        },
-        {
-            'question': 'Is the sun larger than Earth?',
-            'preferred_reasoning': 'Step 1: The sun has a diameter of approximately 1,391,000 km. '
-                                  'Step 2: Earth has a diameter of approximately 12,742 km. '
-                                  'Step 3: Since 1,391,000 >> 12,742, the sun is much larger than Earth.',
-            'dispreferred_reasoning': 'Step 1: The sun appears small in the sky. '
-                                     'Step 2: Earth feels big when we walk on it. '
-                                     'Step 3: Therefore Earth is larger.',
-        },
-    ]
+DATASETS = {
+    "strategyqa": ("strategyqa/data/train_gpt3_responses.jsonl", "strategyqa/data/train_gpt3_responses_counterfactual.json"),
+    "obqa":       ("obqa/data/train_gpt3_responses.jsonl",       "obqa/data/train_gpt3_responses_counterfactual.json"),
+    "quarel":     ("quarel/data/train_gpt3_responses.jsonl",     "quarel/data/train_gpt3_responses_counterfactual.json"),
+    "qasc":       ("qasc/data/train_gpt3_responses.jsonl",       "qasc/data/train_gpt3_responses_output_v2.json"),
+}
 
 
-def create_example_reasoning_data():
-    """Create example data for training the reasoning module"""
-    return [
-        {
-            'question': 'Does a banana have more protein than an apple?',
-            'reasoning': 'Step 1: A banana contains approximately 1.3g of protein per 100g. '
-                        'Step 2: An apple contains approximately 0.3g of protein per 100g. '
-                        'Step 3: Since 1.3g > 0.3g, a banana has more protein.',
-            'answer': 'Yes',
-            'counterfactual_reasoning': 'Step 1: Bananas are yellow. '
-                                       'Step 2: Apples are often red. '
-                                       'Step 3: Yellow fruits have more protein.',
-        },
-        {
-            'question': 'Would a candle last longer than a battery-powered flashlight?',
-            'reasoning': 'Step 1: A typical candle burns for 4-8 hours. '
-                        'Step 2: A battery-powered flashlight can run for 20-100 hours depending on the battery. '
-                        'Step 3: Therefore, a flashlight generally lasts longer.',
-            'answer': 'No',
-            'counterfactual_reasoning': 'Step 1: Candles use fire. '
-                                       'Step 2: Fire is natural energy. '
-                                       'Step 3: Natural energy lasts longer.',
-        },
-        {
-            'question': 'Is the sun larger than Earth?',
-            'reasoning': 'Step 1: The sun has a diameter of approximately 1,391,000 km. '
-                        'Step 2: Earth has a diameter of approximately 12,742 km. '
-                        'Step 3: Since 1,391,000 >> 12,742, the sun is much larger than Earth.',
-            'answer': 'Yes',
-            'counterfactual_reasoning': 'Step 1: The sun appears small in the sky. '
-                                       'Step 2: Earth feels big when we walk on it. '
-                                       'Step 3: Therefore Earth is larger.',
-        },
-    ]
+def load_dataset(name):
+    train_path, cf_path = DATASETS[name]
+    with open(DATA_ROOT / train_path) as f:
+        raw = json.load(f)
+    with open(DATA_ROOT / cf_path) as f:
+        cf_list = json.load(f)
+
+    cf_map = {e["question"]: e["counterfactual"] for e in cf_list}
+
+    by_q = {}
+    for entry in raw.values():
+        q = entry["question"]
+        if q not in by_q:
+            by_q[q] = {"question": q, "gold_label": entry["gold_label"], "rationales": []}
+        if entry.get("predicted_rationale"):
+            by_q[q]["rationales"].append((entry["predicted_rationale"], entry["predicted_label"]))
+
+    dpo_data, reasoning_data = [], []
+    for item in by_q.values():
+        if not item["rationales"]:
+            continue
+        best = next((r for r, l in item["rationales"] if l.strip().lower() == item["gold_label"].strip().lower()), item["rationales"][0][0])
+        q = item["question"]
+        if q in cf_map:
+            dpo_data.append({"question": q, "preferred_reasoning": best, "dispreferred_reasoning": cf_map[q]})
+            reasoning_data.append({"question": q, "reasoning": best, "answer": item["gold_label"], "counterfactual_reasoning": cf_map[q]})
+        else:
+            reasoning_data.append({"question": q, "reasoning": best, "answer": item["gold_label"]})
+
+    return dpo_data, reasoning_data
 
 
-def train_frodo():
-    """Complete training pipeline for FRODO"""
-    
-    print("=" * 70)
-    print("FRODO Training Pipeline")
-    print("=" * 70)
-    
-    # Configuration
+def make_loader(dataset, batch_size, use_ddp, world_size, shuffle=True):
+    if use_ddp:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=int(os.environ.get("RANK", 0)), shuffle=shuffle)
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=2, pin_memory=True)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=2, pin_memory=True)
+
+
+def train_phase(frodo, module_name, dataset, config, optimizer, scheduler, writer, num_epochs, global_step=0):
+    is_inference = (module_name == "inference")
+    module = frodo.inference_module if is_inference else frodo.reasoning_module
+    module.train()
+    loader = make_loader(dataset, config.batch_size, config.use_ddp, config.world_size)
+
+    for epoch in range(num_epochs):
+        if hasattr(loader, "sampler") and isinstance(loader.sampler, DistributedSampler):
+            loader.sampler.set_epoch(epoch)
+        total_loss, n = 0.0, 0
+        for batch in loader:
+            optimizer.zero_grad()
+            dev = config.device
+            if is_inference:
+                out = module(
+                    input_ids=batch["input_ids"].to(dev), attention_mask=batch["attention_mask"].to(dev),
+                    preferred_ids=batch["preferred_ids"].to(dev), preferred_mask=batch["preferred_mask"].to(dev),
+                    dispreferred_ids=batch["dispreferred_ids"].to(dev), dispreferred_mask=batch["dispreferred_mask"].to(dev),
+                )
+            else:
+                cf_ids = batch.get("counterfactual_reasoning_ids")
+                cf_mask = batch.get("counterfactual_reasoning_mask")
+                out = module(
+                    question_ids=batch["question_ids"].to(dev), question_mask=batch["question_mask"].to(dev),
+                    reasoning_ids=batch["reasoning_ids"].to(dev), reasoning_mask=batch["reasoning_mask"].to(dev),
+                    answer_ids=batch["answer_ids"].to(dev),
+                    counterfactual_reasoning_ids=cf_ids.to(dev) if cf_ids is not None else None,
+                    counterfactual_reasoning_mask=cf_mask.to(dev) if cf_mask is not None else None,
+                )
+            loss = out["loss"]
+            loss.backward()
+            optimizer.step()
+            if scheduler:
+                scheduler.step()
+            total_loss += loss.item()
+            n += 1
+            global_step += 1
+            if is_main_process() and writer:
+                writer.add_scalar(f"{module_name}/step_loss", loss.item(), global_step)
+                if not is_inference:
+                    writer.add_scalar(f"{module_name}/lm_loss", out["lm_loss"], global_step)
+                    writer.add_scalar(f"{module_name}/ie_loss", out["ie_loss"], global_step)
+                    writer.add_scalar(f"{module_name}/margin_loss", out["margin_loss"], global_step)
+
+        if is_main_process():
+            avg = total_loss / max(n, 1)
+            print(f"  [{module_name}] epoch {epoch+1}/{num_epochs}  loss={avg:.4f}")
+            if writer:
+                writer.add_scalar(f"{module_name}/epoch_loss", avg, epoch)
+
+    return global_step
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", default="strategyqa", choices=list(DATASETS.keys()))
+    p.add_argument("--model", default="google/flan-t5-base")
+    p.add_argument("--hf_token", default=None)
+    p.add_argument("--max_length", type=int, default=256)
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--num_epochs", type=int, default=3)
+    p.add_argument("--warmup_steps", type=int, default=100)
+    p.add_argument("--beta", type=float, default=0.1)
+    p.add_argument("--lambda_lm", type=float, default=1.0)
+    p.add_argument("--lambda_ie", type=float, default=1.0)
+    p.add_argument("--lambda_margin", type=float, default=1.0)
+    p.add_argument("--margin", type=float, default=1.0)
+    p.add_argument("--output_dir", default="output")
+    p.add_argument("--tensorboard", action="store_true", default=True)
+    p.add_argument("--tensorboard_log_dir", default=None)
+    p.add_argument("--max_samples", type=int, default=None)
+    args = p.parse_args()
+
+    use_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    local_rank, world_size = 0, 1
+    if use_ddp:
+        local_rank = setup_ddp()
+        world_size = int(os.environ["WORLD_SIZE"])
+
     config = FRODOConfig(
-        model_name="google/flan-t5-base",  # Using smaller model for demo
-        max_length=256,
-        learning_rate=5e-5,
-        batch_size=2,
-        num_epochs=3,
-        beta=0.1,
-        lambda_lm=1.0,
-        lambda_ie=1.0,
-        lambda_margin=1.0,
-        margin=1.0,
+        model_name=args.model, max_length=args.max_length, learning_rate=args.lr,
+        batch_size=args.batch_size, num_epochs=args.num_epochs, warmup_steps=args.warmup_steps,
+        beta=args.beta, lambda_lm=args.lambda_lm, lambda_ie=args.lambda_ie,
+        lambda_margin=args.lambda_margin, margin=args.margin,
+        use_ddp=use_ddp, local_rank=local_rank, world_size=world_size,
     )
-    
-    print("\n1. Loading models and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    
-    # Load models for inference and reasoning modules
-    inference_model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name)
-    reasoning_model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name)
-    
-    # Create FRODO framework
-    frodo = FRODO(inference_model, reasoning_model, config)
-    frodo = frodo.to(config.device)
-    
-    # Create reference model for DPO (frozen copy) - AFTER moving main model to device
-    print("2. Creating reference model for DPO...")
-    reference_model = copy.deepcopy(frodo.inference_module.model)
-    frodo.inference_module.set_reference_model(reference_model)
-    
-    print(f"   Models loaded on device: {config.device}")
-    
-    # ========== PHASE 1: Train Inference Module with DPO ==========
-    print("\n" + "=" * 70)
-    print("PHASE 1: Training Inference Module with DPO")
-    print("=" * 70)
-    
-    # Create DPO dataset
-    dpo_data = create_example_dpo_data()
-    dpo_dataset = DPODataset(dpo_data, tokenizer, max_length=config.max_length)
-    dpo_dataloader = DataLoader(dpo_dataset, batch_size=config.batch_size, shuffle=True)
-    
-    # Optimizer for inference module
-    inference_optimizer = torch.optim.AdamW(
-        frodo.inference_module.parameters(),
-        lr=config.learning_rate
-    )
-    
-    print(f"\nTraining with {len(dpo_data)} examples...")
-    frodo.train_inference_module(
-        train_dataloader=dpo_dataloader,
-        num_epochs=config.num_epochs,
-        optimizer=inference_optimizer,
-    )
-    
-    # ========== PHASE 2: Train Reasoning Module ==========
-    print("\n" + "=" * 70)
-    print("PHASE 2: Training Reasoning Module")
-    print("=" * 70)
-    
-    # Create reasoning dataset
-    reasoning_data = create_example_reasoning_data()
-    reasoning_dataset = ReasoningDataset(reasoning_data, tokenizer, max_length=config.max_length)
-    reasoning_dataloader = DataLoader(reasoning_dataset, batch_size=config.batch_size, shuffle=True)
-    
-    # Optimizer for reasoning module
-    reasoning_optimizer = torch.optim.AdamW(
-        frodo.reasoning_module.parameters(),
-        lr=config.learning_rate
-    )
-    
-    print(f"\nTraining with {len(reasoning_data)} examples...")
-    print("Loss components:")
-    print("  - Language Model Loss (L_LM)")
-    print("  - Indirect Effect Loss (L_IE)")
-    print("  - Margin Ranking Loss (L_MR)")
-    print()
-    
-    frodo.train_reasoning_module(
-        train_dataloader=reasoning_dataloader,
-        num_epochs=config.num_epochs,
-        optimizer=reasoning_optimizer,
-    )
-    
-    # ========== PHASE 3: Inference ==========
-    print("\n" + "=" * 70)
-    print("PHASE 3: Testing Inference")
-    print("=" * 70)
-    
-    test_questions = [
-        "Does a banana have more protein than an apple?",
-        "Is the sun larger than Earth?",
-    ]
-    
-    for question in test_questions:
-        print(f"\nQuestion: {question}")
-        reasoning, answer = frodo.generate_reasoning_and_answer(question, tokenizer)
-        print(f"Reasoning: {reasoning}")
-        print(f"Answer: {answer}")
-    
-    print("\n" + "=" * 70)
-    print("Training Complete!")
-    print("=" * 70)
-    
-    return frodo
+
+    if is_main_process():
+        print(f"dataset={args.dataset}  model={args.model}  ddp={use_ddp} x{world_size}  bs={args.batch_size}  lr={args.lr}")
+
+    dpo_data, reasoning_data = load_dataset(args.dataset)
+    if args.max_samples:
+        dpo_data = dpo_data[:args.max_samples]
+        reasoning_data = reasoning_data[:args.max_samples]
+    if is_main_process():
+        print(f"dpo={len(dpo_data)}  reasoning={len(reasoning_data)}")
+
+    tok_kw = {"token": args.hf_token} if args.hf_token else {}
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **tok_kw)
+    inference_model = AutoModelForSeq2SeqLM.from_pretrained(args.model, **tok_kw)
+    reasoning_model = AutoModelForSeq2SeqLM.from_pretrained(args.model, **tok_kw)
+
+    frodo = FRODO(inference_model, reasoning_model, config).to(config.device)
+    ref_model = copy.deepcopy(frodo.inference_module.model)
+    frodo.inference_module.set_reference_model(ref_model)
+    if use_ddp:
+        frodo.wrap_ddp()
+
+    writer = None
+    if is_main_process() and args.tensorboard:
+        log_dir = args.tensorboard_log_dir or f"runs/{args.dataset}"
+        writer = SummaryWriter(log_dir=log_dir)
+
+    dpo_ds = DPODataset(dpo_data, tokenizer, max_length=config.max_length)
+    inf_opt = AdamW(frodo.inference_module.parameters(), lr=config.learning_rate)
+    inf_steps = (len(dpo_ds) // (config.batch_size * world_size) + 1) * config.num_epochs
+    inf_sched = get_linear_schedule_with_warmup(inf_opt, config.warmup_steps, inf_steps)
+
+    if is_main_process():
+        print("=== Phase 1: Inference (DPO) ===")
+    gs = train_phase(frodo, "inference", dpo_ds, config, inf_opt, inf_sched, writer, config.num_epochs)
+
+    rea_ds = ReasoningDataset(reasoning_data, tokenizer, max_length=config.max_length)
+    rea_opt = AdamW(frodo.reasoning_module.parameters(), lr=config.learning_rate)
+    rea_steps = (len(rea_ds) // (config.batch_size * world_size) + 1) * config.num_epochs
+    rea_sched = get_linear_schedule_with_warmup(rea_opt, config.warmup_steps, rea_steps)
+
+    if is_main_process():
+        print("=== Phase 2: Reasoning ===")
+    train_phase(frodo, "reasoning", rea_ds, config, rea_opt, rea_sched, writer, config.num_epochs, gs)
+
+    if is_main_process():
+        out = Path(args.output_dir) / args.dataset
+        out.mkdir(parents=True, exist_ok=True)
+        inf_m = frodo.inference_module._unwrap()
+        rea_m = frodo.reasoning_module._unwrap()
+        inf_m.save_pretrained(out / "inference_model")
+        rea_m.save_pretrained(out / "reasoning_model")
+        tokenizer.save_pretrained(out / "tokenizer")
+        if writer:
+            writer.close()
+        print(f"saved to {out}")
+
+    if use_ddp:
+        cleanup_ddp()
 
 
 if __name__ == "__main__":
-    # Run training
-    trained_frodo = train_frodo()
-    
-    print("\n" + "=" * 70)
-    print("FRODO Loss Functions Summary")
-    print("=" * 70)
-    
-    print("\n1. DPO Loss (Inference Module):")
-    print("   L_DPO = -log(σ(β * (log π_θ(r_w|x) - log π_ref(r_w|x)")
-    print("                      - log π_θ(r_l|x) + log π_ref(r_l|x))))")
-    print("   where:")
-    print("   - r_w: preferred (correct) reasoning chain")
-    print("   - r_l: dispreferred (counterfactual) reasoning chain")
-    print("   - β: temperature parameter")
-    
-    print("\n2. Language Model Loss (Reasoning Module):")
-    print("   L_LM = -log P_θ(y | x, r)")
-    print("   - Standard cross-entropy loss")
-    
-    print("\n3. Indirect Effect Loss (Reasoning Module):")
-    print("   L_IE = -log P_θ(y | x, r)")
-    print("   - Encourages model to condition on reasoning steps")
-    
-    print("\n4. Margin Ranking Loss (Reasoning Module):")
-    print("   L_MR = max(0, margin - (h(x, r_w, y_w) - h(x, r_l, y_w)))")
-    print("   where:")
-    print("   - h(): scoring function (log probability)")
-    print("   - r_w: correct reasoning")
-    print("   - r_l: counterfactual reasoning")
-    
-    print("\n5. Combined Reasoning Loss:")
-    print("   L_PREF = λ_LM * L_LM + λ_IE * L_IE + λ_MR * L_MR")
-    
-    print("\n" + "=" * 70)
+    main()

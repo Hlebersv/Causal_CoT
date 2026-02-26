@@ -8,13 +8,32 @@ This implementation includes:
 2. Reasoning Module - Faithfully reasons over steps using counterfactual and causal preference objectives
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import numpy as np
+
+
+def setup_ddp(backend="nccl"):
+    dist.init_process_group(backend=backend)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    return (not dist.is_initialized()) or dist.get_rank() == 0
 
 
 @dataclass
@@ -41,8 +60,16 @@ class FRODOConfig:
     # Margin ranking parameters
     margin: float = 1.0  # Margin for ranking loss
     
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # DDP
+    use_ddp: bool = False
+    local_rank: int = 0
+    world_size: int = 1
+
+    @property
+    def device(self):
+        if self.use_ddp:
+            return torch.device("cuda", self.local_rank)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class InferenceModule(nn.Module):
@@ -58,7 +85,10 @@ class InferenceModule(nn.Module):
         self.model = base_model
         self.config = config
         self.ref_model = None  # Reference model for DPO (frozen copy)
-        
+
+    def _unwrap(self):
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
     def set_reference_model(self, ref_model):
         """Set the frozen reference model for DPO"""
         self.ref_model = ref_model
@@ -193,7 +223,7 @@ class InferenceModule(nn.Module):
             return {"loss": loss}
         else:
             # Inference mode - generate reasoning chain
-            outputs = self.model.generate(
+            outputs = self._unwrap().generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_length=self.config.max_length,
@@ -216,7 +246,10 @@ class ReasoningModule(nn.Module):
         super().__init__()
         self.model = base_model
         self.config = config
-        
+
+    def _unwrap(self):
+        return self.model.module if isinstance(self.model, DDP) else self.model
+
     def compute_language_model_loss(
         self,
         input_ids: torch.Tensor,
@@ -453,7 +486,16 @@ class FRODO(nn.Module):
         self.config = config
         self.inference_module = InferenceModule(inference_model, config)
         self.reasoning_module = ReasoningModule(reasoning_model, config)
-        
+
+    def wrap_ddp(self):
+        dev = [self.config.local_rank]
+        self.inference_module.model = DDP(
+            self.inference_module.model, device_ids=dev, find_unused_parameters=True,
+        )
+        self.reasoning_module.model = DDP(
+            self.reasoning_module.model, device_ids=dev, find_unused_parameters=True,
+        )
+
     def train_inference_module(
         self,
         train_dataloader,
@@ -493,8 +535,9 @@ class FRODO(nn.Module):
                 total_loss += loss.item()
                 num_batches += 1
             
-            avg_loss = total_loss / num_batches
-            print(f"Epoch {epoch+1}/{num_epochs}, DPO Loss: {avg_loss:.4f}")
+            avg_loss = total_loss / max(num_batches, 1)
+            if is_main_process():
+                print(f"Epoch {epoch+1}/{num_epochs}, DPO Loss: {avg_loss:.4f}")
     
     def train_reasoning_module(
         self,
@@ -551,16 +594,18 @@ class FRODO(nn.Module):
                 total_margin_loss += outputs['margin_loss']
                 num_batches += 1
             
-            avg_loss = total_loss / num_batches
-            avg_lm_loss = total_lm_loss / num_batches
-            avg_ie_loss = total_ie_loss / num_batches
-            avg_margin_loss = total_margin_loss / num_batches
+            n = max(num_batches, 1)
+            avg_loss = total_loss / n
+            avg_lm_loss = total_lm_loss / n
+            avg_ie_loss = total_ie_loss / n
+            avg_margin_loss = total_margin_loss / n
             
-            print(f"Epoch {epoch+1}/{num_epochs}")
-            print(f"  Total Loss: {avg_loss:.4f}")
-            print(f"  LM Loss: {avg_lm_loss:.4f}")
-            print(f"  IE Loss: {avg_ie_loss:.4f}")
-            print(f"  Margin Loss: {avg_margin_loss:.4f}")
+            if is_main_process():
+                print(f"Epoch {epoch+1}/{num_epochs}")
+                print(f"  Total Loss: {avg_loss:.4f}")
+                print(f"  LM Loss: {avg_lm_loss:.4f}")
+                print(f"  IE Loss: {avg_ie_loss:.4f}")
+                print(f"  Margin Loss: {avg_margin_loss:.4f}")
     
     def generate_reasoning_and_answer(
         self,
@@ -603,7 +648,7 @@ class FRODO(nn.Module):
             combined_ids = torch.cat([question_ids, reasoning_ids_tensor], dim=1)
             combined_mask = torch.cat([question_mask, reasoning_mask], dim=1)
             
-            answer_outputs = self.reasoning_module.model.generate(
+            answer_outputs = self.reasoning_module._unwrap().generate(
                 input_ids=combined_ids,
                 attention_mask=combined_mask,
                 max_length=self.config.max_length,
