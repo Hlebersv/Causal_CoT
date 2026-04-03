@@ -1,7 +1,7 @@
 import argparse, json, random
 from pathlib import Path
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 from tqdm import tqdm
 
 from frodo import FRODO, FRODOConfig
@@ -86,11 +86,19 @@ def main():
 
     model_dir = Path(args.model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir / "tokenizer")
-    inference_model = AutoModelForSeq2SeqLM.from_pretrained(model_dir / "inference_model").to(args.device)
-    reasoning_model = AutoModelForSeq2SeqLM.from_pretrained(model_dir / "reasoning_model").to(args.device)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_cfg = AutoConfig.from_pretrained(model_dir / "inference_model")
+    is_enc_dec = getattr(model_cfg, "is_encoder_decoder", False)
+    AutoModelCls = AutoModelForSeq2SeqLM if is_enc_dec else AutoModelForCausalLM
+
+    inference_model = AutoModelCls.from_pretrained(model_dir / "inference_model").to(args.device)
+    reasoning_model = AutoModelCls.from_pretrained(model_dir / "reasoning_model").to(args.device)
 
     gpu_idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
-    config = FRODOConfig(max_length=args.max_length, use_ddp=True, local_rank=gpu_idx)
+    config = FRODOConfig(max_length=args.max_length, use_ddp=True, local_rank=gpu_idx,
+                         is_encoder_decoder=is_enc_dec)
     frodo = FRODO(inference_model, reasoning_model, config)
     frodo = frodo.to(config.device)
     frodo.eval()

@@ -8,3 +8,4 @@ runs/
 training.log
 *.egg-info/
 .DS_Store
+*.log

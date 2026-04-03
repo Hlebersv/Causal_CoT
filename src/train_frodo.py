@@ -1,12 +1,27 @@
-import argparse, copy, json, os
+import argparse, copy, gc, json, os
 from pathlib import Path
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM,
+    AutoTokenizer, get_linear_schedule_with_warmup,
+)
+from peft import LoraConfig, TaskType, get_peft_model
 
-from frodo import FRODO, FRODOConfig, DPODataset, ReasoningDataset, setup_ddp, cleanup_ddp, is_main_process
+from frodo import (
+    FRODOConfig,
+    InferenceModule,
+    ReasoningModule,
+    DPODataset,
+    ReasoningDataset,
+    setup_ddp,
+    cleanup_ddp,
+    is_main_process,
+)
 
 DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 
@@ -57,9 +72,46 @@ def make_loader(dataset, batch_size, use_ddp, world_size, shuffle=True):
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=2, pin_memory=True)
 
 
-def train_phase(frodo, module_name, dataset, config, optimizer, scheduler, writer, num_epochs, global_step=0):
+def make_scheduler(optimizer, dataset_size, config, grad_accum_steps):
+    batches_per_epoch = max((dataset_size + config.batch_size - 1) // config.batch_size, 1)
+    if config.use_ddp:
+        batches_per_epoch = max((dataset_size + (config.batch_size * config.world_size) - 1) // (config.batch_size * config.world_size), 1)
+    optimizer_steps = max((batches_per_epoch * config.num_epochs + grad_accum_steps - 1) // grad_accum_steps, 1)
+    return get_linear_schedule_with_warmup(optimizer, config.warmup_steps, optimizer_steps)
+
+
+def maybe_enable_gradient_checkpointing(model):
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "config"):
+        # Required for checkpointing on most decoder-only HF models.
+        model.config.use_cache = False
+
+
+def maybe_apply_lora(model, use_lora, is_enc_dec, r, alpha, dropout, target_modules):
+    if not use_lora:
+        return model
+    task_type = TaskType.SEQ_2_SEQ_LM if is_enc_dec else TaskType.CAUSAL_LM
+    targets = [m.strip() for m in target_modules.split(",") if m.strip()] if target_modules else None
+    lora_cfg = LoraConfig(
+        r=r,
+        lora_alpha=alpha,
+        lora_dropout=dropout,
+        target_modules=targets,
+        bias="none",
+        task_type=task_type,
+    )
+    return get_peft_model(model, lora_cfg)
+
+
+def cleanup_phase():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def train_phase(module, module_name, dataset, config, optimizer, scheduler, writer, num_epochs, grad_accum_steps=1, global_step=0):
     is_inference = (module_name == "inference")
-    module = frodo.inference_module if is_inference else frodo.reasoning_module
     module.train()
     loader = make_loader(dataset, config.batch_size, config.use_ddp, config.world_size)
 
@@ -67,8 +119,8 @@ def train_phase(frodo, module_name, dataset, config, optimizer, scheduler, write
         if hasattr(loader, "sampler") and isinstance(loader.sampler, DistributedSampler):
             loader.sampler.set_epoch(epoch)
         total_loss, n = 0.0, 0
-        for batch in loader:
-            optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        for step_idx, batch in enumerate(loader):
             dev = config.device
             if is_inference:
                 out = module(
@@ -82,24 +134,29 @@ def train_phase(frodo, module_name, dataset, config, optimizer, scheduler, write
                 out = module(
                     question_ids=batch["question_ids"].to(dev), question_mask=batch["question_mask"].to(dev),
                     reasoning_ids=batch["reasoning_ids"].to(dev), reasoning_mask=batch["reasoning_mask"].to(dev),
-                    answer_ids=batch["answer_ids"].to(dev),
+                    answer_ids=batch["answer_ids"].to(dev), answer_mask=batch["answer_mask"].to(dev),
                     counterfactual_reasoning_ids=cf_ids.to(dev) if cf_ids is not None else None,
                     counterfactual_reasoning_mask=cf_mask.to(dev) if cf_mask is not None else None,
                 )
-            loss = out["loss"]
+            loss = out["loss"] / grad_accum_steps
             loss.backward()
-            optimizer.step()
-            if scheduler:
-                scheduler.step()
-            total_loss += loss.item()
+            should_step = ((step_idx + 1) % grad_accum_steps == 0) or (step_idx + 1 == len(loader))
+            if should_step:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler:
+                    scheduler.step()
+                global_step += 1
+            total_loss += out["loss"].item()
             n += 1
-            global_step += 1
             if is_main_process() and writer:
-                writer.add_scalar(f"{module_name}/step_loss", loss.item(), global_step)
-                if not is_inference:
-                    writer.add_scalar(f"{module_name}/lm_loss", out["lm_loss"], global_step)
-                    writer.add_scalar(f"{module_name}/ie_loss", out["ie_loss"], global_step)
-                    writer.add_scalar(f"{module_name}/margin_loss", out["margin_loss"], global_step)
+                writer.add_scalar(f"{module_name}/micro_step_loss", out["loss"].item(), epoch * len(loader) + step_idx)
+                if should_step:
+                    writer.add_scalar(f"{module_name}/step_loss", out["loss"].item(), global_step)
+                    if not is_inference:
+                        writer.add_scalar(f"{module_name}/lm_loss", out["lm_loss"], global_step)
+                        writer.add_scalar(f"{module_name}/ie_loss", out["ie_loss"], global_step)
+                        writer.add_scalar(f"{module_name}/margin_loss", out["margin_loss"], global_step)
 
         if is_main_process():
             avg = total_loss / max(n, 1)
@@ -129,6 +186,17 @@ def main():
     p.add_argument("--tensorboard", action="store_true", default=True)
     p.add_argument("--tensorboard_log_dir", default=None)
     p.add_argument("--max_samples", type=int, default=None)
+    p.add_argument("--grad_accum_steps", type=int, default=1)
+    p.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--find_unused_parameters", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--lora_r", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument(
+        "--lora_target_modules",
+        default="q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj",
+    )
     args = p.parse_args()
 
     use_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -146,7 +214,10 @@ def main():
     )
 
     if is_main_process():
-        print(f"dataset={args.dataset}  model={args.model}  ddp={use_ddp} x{world_size}  bs={args.batch_size}  lr={args.lr}")
+        print(
+            f"dataset={args.dataset}  model={args.model}  ddp={use_ddp} x{world_size}  "
+            f"bs={args.batch_size}  accum={args.grad_accum_steps}  lr={args.lr}  lora={args.use_lora}"
+        )
 
     dpo_data, reasoning_data = load_dataset(args.dataset)
     if args.max_samples:
@@ -156,50 +227,134 @@ def main():
         print(f"dpo={len(dpo_data)}  reasoning={len(reasoning_data)}")
 
     tok_kw = {"token": args.hf_token} if args.hf_token else {}
-    tokenizer = AutoTokenizer.from_pretrained(args.model, **tok_kw)
-    inference_model = AutoModelForSeq2SeqLM.from_pretrained(args.model, **tok_kw)
-    reasoning_model = AutoModelForSeq2SeqLM.from_pretrained(args.model, **tok_kw)
+    model_cfg = AutoConfig.from_pretrained(args.model, **tok_kw)
+    is_enc_dec = getattr(model_cfg, "is_encoder_decoder", False)
+    config.is_encoder_decoder = is_enc_dec
 
-    frodo = FRODO(inference_model, reasoning_model, config).to(config.device)
-    ref_model = copy.deepcopy(frodo.inference_module.model)
-    frodo.inference_module.set_reference_model(ref_model)
-    if use_ddp:
-        frodo.wrap_ddp()
+    AutoModelCls = AutoModelForSeq2SeqLM if is_enc_dec else AutoModelForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, **tok_kw)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kw = dict(tok_kw)
+    if not is_enc_dec and torch.cuda.is_available():
+        model_kw["torch_dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    if is_main_process():
+        print(f"arch={'enc-dec' if is_enc_dec else 'causal'}  pad_token={tokenizer.pad_token}")
 
     writer = None
     if is_main_process() and args.tensorboard:
         log_dir = args.tensorboard_log_dir or f"runs/{args.dataset}"
         writer = SummaryWriter(log_dir=log_dir)
 
-    dpo_ds = DPODataset(dpo_data, tokenizer, max_length=config.max_length)
-    inf_opt = AdamW(frodo.inference_module.parameters(), lr=config.learning_rate)
-    inf_steps = (len(dpo_ds) // (config.batch_size * world_size) + 1) * config.num_epochs
-    inf_sched = get_linear_schedule_with_warmup(inf_opt, config.warmup_steps, inf_steps)
+    out = Path(args.output_dir) / args.dataset
+    if is_main_process():
+        out.mkdir(parents=True, exist_ok=True)
 
+    dpo_ds = DPODataset(dpo_data, tokenizer, max_length=config.max_length)
     if is_main_process():
         print("=== Phase 1: Inference (DPO) ===")
-    gs = train_phase(frodo, "inference", dpo_ds, config, inf_opt, inf_sched, writer, config.num_epochs)
+    inference_model = AutoModelCls.from_pretrained(args.model, **model_kw)
+    inference_model = maybe_apply_lora(
+        inference_model,
+        args.use_lora,
+        is_enc_dec,
+        args.lora_r,
+        args.lora_alpha,
+        args.lora_dropout,
+        args.lora_target_modules,
+    )
+    if args.gradient_checkpointing:
+        maybe_enable_gradient_checkpointing(inference_model)
+    inference_module = InferenceModule(inference_model, config).to(config.device)
+    ref_model = None
+    if not args.use_lora:
+        ref_model = copy.deepcopy(inference_module.model)
+        inference_module.set_reference_model(ref_model)
+    elif is_main_process():
+        print("using base model (disabled adapters) as DPO reference")
+    if use_ddp:
+        inference_module.model = DDP(
+            inference_module.model,
+            device_ids=[config.local_rank],
+            find_unused_parameters=args.find_unused_parameters,
+        )
+    if args.use_lora and is_main_process() and hasattr(inference_module._unwrap(), "print_trainable_parameters"):
+        inference_module._unwrap().print_trainable_parameters()
+    inf_opt = AdamW((p for p in inference_module.parameters() if p.requires_grad), lr=config.learning_rate)
+    inf_sched = make_scheduler(inf_opt, len(dpo_ds), config, args.grad_accum_steps)
+    gs = train_phase(
+        inference_module,
+        "inference",
+        dpo_ds,
+        config,
+        inf_opt,
+        inf_sched,
+        writer,
+        config.num_epochs,
+        grad_accum_steps=args.grad_accum_steps,
+    )
+    if use_ddp and dist.is_initialized():
+        dist.barrier()
+    if is_main_process():
+        inference_module._unwrap().save_pretrained(out / "inference_model")
+    if ref_model is not None:
+        del ref_model
+    del inference_module, inference_model, inf_opt, inf_sched
+    cleanup_phase()
+    if use_ddp and dist.is_initialized():
+        dist.barrier()
 
     rea_ds = ReasoningDataset(reasoning_data, tokenizer, max_length=config.max_length)
-    rea_opt = AdamW(frodo.reasoning_module.parameters(), lr=config.learning_rate)
-    rea_steps = (len(rea_ds) // (config.batch_size * world_size) + 1) * config.num_epochs
-    rea_sched = get_linear_schedule_with_warmup(rea_opt, config.warmup_steps, rea_steps)
-
     if is_main_process():
         print("=== Phase 2: Reasoning ===")
-    train_phase(frodo, "reasoning", rea_ds, config, rea_opt, rea_sched, writer, config.num_epochs, gs)
-
+    reasoning_model = AutoModelCls.from_pretrained(args.model, **model_kw)
+    reasoning_model = maybe_apply_lora(
+        reasoning_model,
+        args.use_lora,
+        is_enc_dec,
+        args.lora_r,
+        args.lora_alpha,
+        args.lora_dropout,
+        args.lora_target_modules,
+    )
+    if args.gradient_checkpointing:
+        maybe_enable_gradient_checkpointing(reasoning_model)
+    reasoning_module = ReasoningModule(reasoning_model, config).to(config.device)
+    if use_ddp:
+        reasoning_module.model = DDP(
+            reasoning_module.model,
+            device_ids=[config.local_rank],
+            find_unused_parameters=args.find_unused_parameters,
+        )
+    if args.use_lora and is_main_process() and hasattr(reasoning_module._unwrap(), "print_trainable_parameters"):
+        reasoning_module._unwrap().print_trainable_parameters()
+    rea_opt = AdamW((p for p in reasoning_module.parameters() if p.requires_grad), lr=config.learning_rate)
+    rea_sched = make_scheduler(rea_opt, len(rea_ds), config, args.grad_accum_steps)
+    train_phase(
+        reasoning_module,
+        "reasoning",
+        rea_ds,
+        config,
+        rea_opt,
+        rea_sched,
+        writer,
+        config.num_epochs,
+        grad_accum_steps=args.grad_accum_steps,
+        global_step=gs,
+    )
+    if use_ddp and dist.is_initialized():
+        dist.barrier()
     if is_main_process():
-        out = Path(args.output_dir) / args.dataset
-        out.mkdir(parents=True, exist_ok=True)
-        inf_m = frodo.inference_module._unwrap()
-        rea_m = frodo.reasoning_module._unwrap()
-        inf_m.save_pretrained(out / "inference_model")
-        rea_m.save_pretrained(out / "reasoning_model")
+        reasoning_module._unwrap().save_pretrained(out / "reasoning_model")
         tokenizer.save_pretrained(out / "tokenizer")
         if writer:
             writer.close()
         print(f"saved to {out}")
+    del reasoning_module, reasoning_model, rea_opt, rea_sched
+    cleanup_phase()
 
     if use_ddp:
         cleanup_ddp()

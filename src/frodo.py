@@ -60,6 +60,9 @@ class FRODOConfig:
     # Margin ranking parameters
     margin: float = 1.0  # Margin for ranking loss
     
+    # Architecture
+    is_encoder_decoder: bool = True
+
     # DDP
     use_ddp: bool = False
     local_rank: int = 0
@@ -70,6 +73,20 @@ class FRODOConfig:
         if self.use_ddp:
             return torch.device("cuda", self.local_rank)
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _forward_lm(model, input_ids, input_mask, target_ids, target_mask, is_encoder_decoder):
+    """Compute forward pass with labels, handling both seq2seq and causal architectures."""
+    if is_encoder_decoder:
+        return model(input_ids=input_ids, attention_mask=input_mask,
+                      labels=target_ids, return_dict=True)
+    causal_labels = target_ids.clone()
+    causal_labels[target_mask == 0] = -100
+    full_ids = torch.cat([input_ids, target_ids], dim=1)
+    full_mask = torch.cat([input_mask, target_mask], dim=1)
+    full_labels = torch.cat([torch.full_like(input_ids, -100), causal_labels], dim=1)
+    return model(input_ids=full_ids, attention_mask=full_mask,
+                  labels=full_labels, return_dict=True)
 
 
 class InferenceModule(nn.Module):
@@ -134,41 +151,47 @@ class InferenceModule(nn.Module):
         Returns:
             DPO loss value
         """
-        # Compute log probabilities for preferred sequence
-        preferred_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=preferred_ids,
-            return_dict=True
+        enc_dec = self.config.is_encoder_decoder
+
+        preferred_outputs = _forward_lm(
+            self.model, input_ids, attention_mask,
+            preferred_ids, preferred_mask, enc_dec,
         )
-        
-        # Compute log probabilities for dispreferred sequence
-        dispreferred_outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=dispreferred_ids,
-            return_dict=True
+
+        dispreferred_outputs = _forward_lm(
+            self.model, input_ids, attention_mask,
+            dispreferred_ids, dispreferred_mask, enc_dec,
         )
         
         # Get log probabilities from the model
         preferred_logprobs = -preferred_outputs.loss
         dispreferred_logprobs = -dispreferred_outputs.loss
         
-        # Compute reference model log probabilities (if available)
         if self.ref_model is not None:
             with torch.no_grad():
-                ref_preferred_outputs = self.ref_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=preferred_ids,
-                    return_dict=True
+                ref_preferred_outputs = _forward_lm(
+                    self.ref_model, input_ids, attention_mask,
+                    preferred_ids, preferred_mask, enc_dec,
                 )
-                ref_dispreferred_outputs = self.ref_model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=dispreferred_ids,
-                    return_dict=True
+                ref_dispreferred_outputs = _forward_lm(
+                    self.ref_model, input_ids, attention_mask,
+                    dispreferred_ids, dispreferred_mask, enc_dec,
                 )
+                ref_preferred_logprobs = -ref_preferred_outputs.loss
+                ref_dispreferred_logprobs = -ref_dispreferred_outputs.loss
+        elif hasattr(self._unwrap(), "disable_adapter"):
+            # LoRA mode: use base-model logits as reference without materializing a full copy.
+            with torch.no_grad():
+                base_model = self._unwrap()
+                with base_model.disable_adapter():
+                    ref_preferred_outputs = _forward_lm(
+                        base_model, input_ids, attention_mask,
+                        preferred_ids, preferred_mask, enc_dec,
+                    )
+                    ref_dispreferred_outputs = _forward_lm(
+                        base_model, input_ids, attention_mask,
+                        dispreferred_ids, dispreferred_mask, enc_dec,
+                    )
                 ref_preferred_logprobs = -ref_preferred_outputs.loss
                 ref_dispreferred_logprobs = -ref_dispreferred_outputs.loss
         else:
@@ -222,13 +245,14 @@ class InferenceModule(nn.Module):
             )
             return {"loss": loss}
         else:
-            # Inference mode - generate reasoning chain
-            outputs = self._unwrap().generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=self.config.max_length,
-                num_return_sequences=1,
-            )
+            gen_kwargs = dict(attention_mask=attention_mask, num_return_sequences=1)
+            if self.config.is_encoder_decoder:
+                gen_kwargs["max_length"] = self.config.max_length
+            else:
+                gen_kwargs["max_new_tokens"] = self.config.max_length
+            outputs = self._unwrap().generate(input_ids=input_ids, **gen_kwargs)
+            if not self.config.is_encoder_decoder:
+                outputs = outputs[:, input_ids.shape[1]:]
             return {"generated_ids": outputs}
 
 
@@ -255,6 +279,7 @@ class ReasoningModule(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
+        label_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Compute standard language model loss
@@ -265,20 +290,10 @@ class ReasoningModule(nn.Module):
         - y: correct answer
         - x: question
         - r: reasoning chain
-        
-        Args:
-            input_ids: Concatenated [question, reasoning chain] tokens
-            attention_mask: Attention mask
-            labels: Target answer tokens
-            
-        Returns:
-            Language model loss
         """
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            return_dict=True
+        outputs = _forward_lm(
+            self.model, input_ids, attention_mask,
+            labels, label_mask, self.config.is_encoder_decoder,
         )
         return outputs.loss
     
@@ -289,39 +304,20 @@ class ReasoningModule(nn.Module):
         reasoning_ids: torch.Tensor,
         reasoning_mask: torch.Tensor,
         answer_ids: torch.Tensor,
+        answer_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute Indirect Effect Loss to encourage faithful reasoning
-        
-        The indirect effect loss measures how much the reasoning chain influences
-        the final answer. It encourages the model to actually use the reasoning steps.
-        
+        Compute Indirect Effect Loss to encourage faithful reasoning.
+
         L_IE = -log P_θ(y | x, r)
-        
-        This is computed by conditioning on both the question and reasoning steps.
-        
-        Args:
-            question_ids: Question tokens
-            question_mask: Question attention mask
-            reasoning_ids: Reasoning chain tokens
-            reasoning_mask: Reasoning attention mask
-            answer_ids: Answer tokens
-            
-        Returns:
-            Indirect effect loss
         """
-        # Concatenate question and reasoning
         input_ids = torch.cat([question_ids, reasoning_ids], dim=1)
         attention_mask = torch.cat([question_mask, reasoning_mask], dim=1)
-        
-        # Compute loss conditioning on both question and reasoning
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=answer_ids,
-            return_dict=True
+
+        outputs = _forward_lm(
+            self.model, input_ids, attention_mask,
+            answer_ids, answer_mask, self.config.is_encoder_decoder,
         )
-        
         return outputs.loss
     
     def compute_margin_ranking_loss(
@@ -333,69 +329,38 @@ class ReasoningModule(nn.Module):
         counterfactual_reasoning_ids: torch.Tensor,
         counterfactual_reasoning_mask: torch.Tensor,
         answer_ids: torch.Tensor,
+        answer_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute Margin Ranking Loss for contrastive learning
-        
+        Compute Margin Ranking Loss for contrastive learning.
+
         L_MR = max(0, margin - (h(x, r_w, y_w) - h(x, r_l, y_w)))
-        
-        where:
-        - h(): scoring function (log probability)
-        - r_w: correct reasoning chain
-        - r_l: counterfactual reasoning chain
-        - y_w: correct answer
-        - margin: margin hyperparameter
-        
-        This loss maximizes the margin between:
-        - Positive: (question, correct reasoning, correct answer)
-        - Negative: (question, counterfactual reasoning, correct answer)
-        
-        Args:
-            question_ids: Question tokens
-            question_mask: Question attention mask
-            correct_reasoning_ids: Correct reasoning chain tokens
-            correct_reasoning_mask: Correct reasoning attention mask
-            counterfactual_reasoning_ids: Counterfactual reasoning chain tokens
-            counterfactual_reasoning_mask: Counterfactual reasoning attention mask
-            answer_ids: Correct answer tokens
-            
-        Returns:
-            Margin ranking loss
         """
-        # Compute score for correct reasoning
+        enc_dec = self.config.is_encoder_decoder
+
         correct_input_ids = torch.cat([question_ids, correct_reasoning_ids], dim=1)
         correct_attention_mask = torch.cat([question_mask, correct_reasoning_mask], dim=1)
-        
-        correct_outputs = self.model(
-            input_ids=correct_input_ids,
-            attention_mask=correct_attention_mask,
-            labels=answer_ids,
-            return_dict=True
+
+        correct_outputs = _forward_lm(
+            self.model, correct_input_ids, correct_attention_mask,
+            answer_ids, answer_mask, enc_dec,
         )
-        
-        # Score is negative log probability (we want to minimize this)
-        correct_score = -(-correct_outputs.loss)  # Convert to log prob
-        
-        # Compute score for counterfactual reasoning
+        correct_score = correct_outputs.loss
+
         counterfactual_input_ids = torch.cat([question_ids, counterfactual_reasoning_ids], dim=1)
         counterfactual_attention_mask = torch.cat([question_mask, counterfactual_reasoning_mask], dim=1)
-        
-        counterfactual_outputs = self.model(
-            input_ids=counterfactual_input_ids,
-            attention_mask=counterfactual_attention_mask,
-            labels=answer_ids,
-            return_dict=True
+
+        counterfactual_outputs = _forward_lm(
+            self.model, counterfactual_input_ids, counterfactual_attention_mask,
+            answer_ids, answer_mask, enc_dec,
         )
-        
-        counterfactual_score = -(-counterfactual_outputs.loss)  # Convert to log prob
-        
-        # Margin ranking loss: max(0, margin - (correct_score - counterfactual_score))
-        # We want correct_score > counterfactual_score by at least margin
+        counterfactual_score = counterfactual_outputs.loss
+
         margin_loss = torch.clamp(
             self.config.margin - (correct_score - counterfactual_score),
             min=0
         ).mean()
-        
+
         return margin_loss
     
     def forward(
@@ -405,56 +370,39 @@ class ReasoningModule(nn.Module):
         reasoning_ids: torch.Tensor,
         reasoning_mask: torch.Tensor,
         answer_ids: torch.Tensor,
+        answer_mask: Optional[torch.Tensor] = None,
         counterfactual_reasoning_ids: Optional[torch.Tensor] = None,
         counterfactual_reasoning_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for reasoning module
-        
-        Computes the combined loss:
-        L_PREF = λ_LM * L_LM + λ_IE * L_IE + λ_MR * L_MR
-        
-        Args:
-            question_ids: Question tokens
-            question_mask: Question attention mask
-            reasoning_ids: Reasoning chain tokens
-            reasoning_mask: Reasoning attention mask
-            answer_ids: Answer tokens
-            counterfactual_reasoning_ids: Counterfactual reasoning chain tokens (optional)
-            counterfactual_reasoning_mask: Counterfactual reasoning attention mask (optional)
-            
-        Returns:
-            Dictionary containing total loss and individual loss components
+        Forward pass for reasoning module.
+
+        Computes the combined loss:  L_PREF = λ_LM * L_LM + λ_IE * L_IE + λ_MR * L_MR
         """
-        # Compute Language Model Loss
+        if answer_mask is None:
+            answer_mask = torch.ones_like(answer_ids)
+
         input_ids = torch.cat([question_ids, reasoning_ids], dim=1)
         attention_mask = torch.cat([question_mask, reasoning_mask], dim=1)
-        
+
         lm_loss = self.compute_language_model_loss(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=answer_ids
+            input_ids=input_ids, attention_mask=attention_mask,
+            labels=answer_ids, label_mask=answer_mask,
         )
-        
-        # Compute Indirect Effect Loss
+
         ie_loss = self.compute_indirect_effect_loss(
-            question_ids=question_ids,
-            question_mask=question_mask,
-            reasoning_ids=reasoning_ids,
-            reasoning_mask=reasoning_mask,
-            answer_ids=answer_ids
+            question_ids=question_ids, question_mask=question_mask,
+            reasoning_ids=reasoning_ids, reasoning_mask=reasoning_mask,
+            answer_ids=answer_ids, answer_mask=answer_mask,
         )
-        
-        # Compute Margin Ranking Loss (if counterfactual data provided)
+
         if counterfactual_reasoning_ids is not None:
             margin_loss = self.compute_margin_ranking_loss(
-                question_ids=question_ids,
-                question_mask=question_mask,
-                correct_reasoning_ids=reasoning_ids,
-                correct_reasoning_mask=reasoning_mask,
+                question_ids=question_ids, question_mask=question_mask,
+                correct_reasoning_ids=reasoning_ids, correct_reasoning_mask=reasoning_mask,
                 counterfactual_reasoning_ids=counterfactual_reasoning_ids,
                 counterfactual_reasoning_mask=counterfactual_reasoning_mask,
-                answer_ids=answer_ids
+                answer_ids=answer_ids, answer_mask=answer_mask,
             )
         else:
             margin_loss = torch.tensor(0.0, device=question_ids.device)
@@ -580,6 +528,7 @@ class FRODO(nn.Module):
                     reasoning_ids=batch['reasoning_ids'].to(self.config.device),
                     reasoning_mask=batch['reasoning_mask'].to(self.config.device),
                     answer_ids=batch['answer_ids'].to(self.config.device),
+                    answer_mask=batch['answer_mask'].to(self.config.device),
                     counterfactual_reasoning_ids=cf_ids,
                     counterfactual_reasoning_mask=cf_mask,
                 )
@@ -638,22 +587,25 @@ class FRODO(nn.Module):
             reasoning_ids = inference_outputs['generated_ids']
             reasoning_text = tokenizer.decode(reasoning_ids[0], skip_special_tokens=True)
             
-            # Step 2: Generate answer using reasoning module
             question_ids = input_ids
             question_mask = attention_mask
             reasoning_ids_tensor = tokenizer.encode(reasoning_text, return_tensors='pt').to(self.config.device)
             reasoning_mask = torch.ones_like(reasoning_ids_tensor)
-            
-            # Concatenate for answer generation
+
             combined_ids = torch.cat([question_ids, reasoning_ids_tensor], dim=1)
             combined_mask = torch.cat([question_mask, reasoning_mask], dim=1)
-            
+
+            gen_kw = dict(attention_mask=combined_mask)
+            if self.config.is_encoder_decoder:
+                gen_kw["max_length"] = self.config.max_length
+            else:
+                gen_kw["max_new_tokens"] = self.config.max_length
             answer_outputs = self.reasoning_module._unwrap().generate(
-                input_ids=combined_ids,
-                attention_mask=combined_mask,
-                max_length=self.config.max_length,
+                input_ids=combined_ids, **gen_kw,
             )
-            
+            if not self.config.is_encoder_decoder:
+                answer_outputs = answer_outputs[:, combined_ids.shape[1]:]
+
             answer_text = tokenizer.decode(answer_outputs[0], skip_special_tokens=True)
             
         return reasoning_text, answer_text
@@ -777,6 +729,7 @@ class ReasoningDataset(Dataset):
             'reasoning_ids': reasoning_encoding['input_ids'].squeeze(0),
             'reasoning_mask': reasoning_encoding['attention_mask'].squeeze(0),
             'answer_ids': answer_encoding['input_ids'].squeeze(0),
+            'answer_mask': answer_encoding['attention_mask'].squeeze(0),
         }
         
         # Add counterfactual reasoning if available
