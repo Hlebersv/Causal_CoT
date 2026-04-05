@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
 from tqdm import tqdm
+from peft import PeftConfig, PeftModel
 
 from frodo import FRODO, FRODOConfig
 
@@ -74,6 +75,68 @@ def is_correct(pred, gold):
     return False
 
 
+def load_tokenizer(model_dir, fallback_name):
+    tok_dir = model_dir / "tokenizer"
+    if tok_dir.exists():
+        tok = AutoTokenizer.from_pretrained(tok_dir)
+    else:
+        tok = AutoTokenizer.from_pretrained(fallback_name)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+
+def select_model_kwargs(device):
+    if not device.startswith("cuda"):
+        return {}
+    return {"torch_dtype": torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16}
+
+
+def load_model_from_dir(model_path, device, fallback_base=None):
+    model_path = Path(model_path)
+    model_kw = select_model_kwargs(device)
+
+    adapter_cfg = model_path / "adapter_config.json"
+    if adapter_cfg.exists():
+        peft_cfg = PeftConfig.from_pretrained(model_path)
+        base_name = peft_cfg.base_model_name_or_path if peft_cfg.base_model_name_or_path else fallback_base
+        if base_name is None:
+            raise ValueError(f"Unable to determine base model for adapter at {model_path}")
+        base_cfg = AutoConfig.from_pretrained(base_name)
+        is_enc_dec = getattr(base_cfg, "is_encoder_decoder", False)
+        AutoModelCls = AutoModelForSeq2SeqLM if is_enc_dec else AutoModelForCausalLM
+        base_model = AutoModelCls.from_pretrained(base_name, **model_kw)
+        model = PeftModel.from_pretrained(base_model, model_path)
+        return model.to(device), is_enc_dec, base_name
+
+    model_cfg = AutoConfig.from_pretrained(model_path)
+    is_enc_dec = getattr(model_cfg, "is_encoder_decoder", False)
+    AutoModelCls = AutoModelForSeq2SeqLM if is_enc_dec else AutoModelForCausalLM
+    model = AutoModelCls.from_pretrained(model_path, **model_kw).to(device)
+    return model, is_enc_dec, str(model_path)
+
+
+def generate_text(model, tokenizer, prompt, device, max_new_tokens):
+    encoded = tokenizer(prompt, return_tensors="pt").to(device)
+    gen_kw = dict(**encoded, do_sample=False)
+    if getattr(model.config, "is_encoder_decoder", False):
+        gen_kw["max_length"] = encoded["input_ids"].shape[1] + max_new_tokens
+    else:
+        gen_kw["max_new_tokens"] = max_new_tokens
+    out = model.generate(**gen_kw)
+    if not getattr(model.config, "is_encoder_decoder", False):
+        out = out[:, encoded["input_ids"].shape[1]:]
+    return tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+
+def clean_answer(text):
+    answer = text.strip().split("\n")[0]
+    for prefix in ["answer:", "final answer:"]:
+        if answer.lower().startswith(prefix):
+            answer = answer[len(prefix):].strip()
+    return answer
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", default="strategyqa", choices=list(TEST_FILES.keys()))
@@ -82,26 +145,32 @@ def main():
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--n_shots", type=int, default=3)
+    p.add_argument("--inference_only", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--max_reasoning_tokens", type=int, default=128)
+    p.add_argument("--max_answer_tokens", type=int, default=16)
     args = p.parse_args()
 
     model_dir = Path(args.model_dir)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir / "tokenizer")
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    inference_model, is_enc_dec, base_name = load_model_from_dir(model_dir / "inference_model", args.device)
+    tokenizer = load_tokenizer(model_dir, base_name)
 
-    model_cfg = AutoConfig.from_pretrained(model_dir / "inference_model")
-    is_enc_dec = getattr(model_cfg, "is_encoder_decoder", False)
-    AutoModelCls = AutoModelForSeq2SeqLM if is_enc_dec else AutoModelForCausalLM
-
-    inference_model = AutoModelCls.from_pretrained(model_dir / "inference_model").to(args.device)
-    reasoning_model = AutoModelCls.from_pretrained(model_dir / "reasoning_model").to(args.device)
-
-    gpu_idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
-    config = FRODOConfig(max_length=args.max_length, use_ddp=True, local_rank=gpu_idx,
-                         is_encoder_decoder=is_enc_dec)
-    frodo = FRODO(inference_model, reasoning_model, config)
-    frodo = frodo.to(config.device)
-    frodo.eval()
+    has_reasoning_model = (model_dir / "reasoning_model").exists()
+    inference_only = args.inference_only or (not has_reasoning_model)
+    frodo = None
+    if not inference_only:
+        reasoning_model, _, _ = load_model_from_dir(model_dir / "reasoning_model", args.device, fallback_base=base_name)
+        gpu_idx = int(args.device.split(":")[-1]) if ":" in args.device else 0
+        config = FRODOConfig(
+            max_length=args.max_length,
+            use_ddp=False,
+            local_rank=gpu_idx,
+            is_encoder_decoder=is_enc_dec,
+        )
+        frodo = FRODO(inference_model, reasoning_model, config).to(config.device)
+        frodo.eval()
+    else:
+        inference_model.eval()
+        print("Running in inference-only mode")
 
     few_shot_examples = []
     if args.n_shots > 0:
@@ -118,7 +187,26 @@ def main():
             prompt = build_few_shot_prompt(item["question"], few_shot_examples)
         else:
             prompt = item["question"]
-        reasoning, answer = frodo.generate_reasoning_and_answer(prompt, tokenizer)
+        if inference_only:
+            reasoning = generate_text(
+                inference_model,
+                tokenizer,
+                prompt,
+                args.device,
+                max_new_tokens=args.max_reasoning_tokens,
+            )
+            answer_prompt = f"{prompt}\nReasoning: {reasoning}\nAnswer:"
+            answer = clean_answer(
+                generate_text(
+                    inference_model,
+                    tokenizer,
+                    answer_prompt,
+                    args.device,
+                    max_new_tokens=args.max_answer_tokens,
+                )
+            )
+        else:
+            reasoning, answer = frodo.generate_reasoning_and_answer(prompt, tokenizer)
         hit = is_correct(answer, item["gold_label"])
         correct += int(hit)
         total += 1
